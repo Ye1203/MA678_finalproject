@@ -1,0 +1,359 @@
+---
+title: "final_project"
+author: "Bingtian Ye"
+date: "2023-11-27"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyverse)
+```
+## Data preparing
+### Data prepare for condition——soil
+```{r}
+soil <- read.csv("soil_data.csv")
+soil <- soil |>
+  select(c(fips,elevation,slope1,slope2,slope3,slope4,slope5,slope6,slope7,slope8,WAT_LAND,NVG_LAND,URB_LAND,GRS_LAND,FOR_LAND,CULT_LAND))|>
+  mutate(
+    weighted_slope = slope1 * 0.25 + 
+                     slope2 * 1.25 + 
+                     slope3 * 3.5 + 
+                     slope4 * 7.5 + 
+                     slope5 * 12.5 + 
+                     slope6 * 22.5 + 
+                     slope7 * 37.5 + 
+                     slope8 * 50  #choose the last group's median point as 50
+  )|>#using median point to calculate slopes
+  select(-slope1, -slope2, -slope3, -slope4, -slope5, -slope6, -slope7, -slope8)
+rows <- nrow(soil)
+third <- rows / 3
+soil <- soil %>%
+  arrange(desc(weighted_slope)) %>%
+  mutate(slope = ifelse(row_number() <= third, "large", ifelse(row_number() >= third*2, "small", "medium"))) %>%
+  select(-weighted_slope)
+
+```
+### Data prepare for condition——weather
+```{r}
+test <- read.csv("test_timeseries.csv")
+test <- test |>
+  select(fips, date, QV2M, WS10M, WS50M, PRECTOT)
+test$year <- sapply(strsplit(test$date, "-"), `[`, 1) #select year
+test <- test |>
+  select(-date)
+# since train_timeseries.csv is too big, I use Sqlite to deal with it
+library(DBI)
+library(RSQLite)
+con <- dbConnect(RSQLite::SQLite(),"my_database.sqlite")
+dbWriteTable(con, "train", "train_timeseries.csv", row.names = FALSE)
+dbSendQuery(con, "
+  CREATE TABLE train_processed_1 AS
+  SELECT 
+    fips, 
+    QV2M, 
+    WS10M, 
+    WS50M, 
+    PRECTOT, 
+    SUBSTR(date, 1, 4) AS year
+  FROM train
+  WHERE SUBSTR(date, 1, 4) BETWEEN '2012' AND '2020'
+")
+train <- dbReadTable(con, "train_processed_1")
+dbDisconnect(con)
+
+#combine 2 dataset
+weather <- rbind(test,train)
+rm(test,train)# remove test and train from the environment
+weather <- weather |>
+  group_by(fips) |>
+  summarise(
+    mean_QV2M = mean(QV2M, na.rm = TRUE),
+    mean_WS10M = mean(WS10M, na.rm = TRUE),
+    mean_WS50M = mean(WS50M, na.rm = TRUE),
+    mean_PRECTOT = mean(PRECTOT, na.rm = TRUE)
+  )
+
+#Compare which county miss between weather and soil
+missing_fips <- setdiff(soil$fips, weather$fips)
+#Missing Weston County, Wyoming
+```
+### Data prepare for drought
+```{r}
+drought <- read.csv("drought.csv")
+drought <- drought|>
+  mutate(None = as.numeric(gsub(",", "", None)),#remove ","
+         D0 = as.numeric(gsub(",", "", D0)),
+         D1 = as.numeric(gsub(",", "", D1)),
+         D2 = as.numeric(gsub(",", "", D2)),
+         D3 = as.numeric(gsub(",", "", D3)),
+         D4 = as.numeric(gsub(",", "", D4)),
+  )|>
+  mutate(sum = None + D0)|>
+  mutate(fips = FIPS,
+         None = None/sum,
+         D0 = D0/sum,
+         D1 = D1/sum,
+         D2 = D2/sum,
+         D3 = D3/sum,
+         D4 = D4/sum,
+         .keep = "none"
+  )|>
+  group_by(fips) |>
+  summarise(
+    mean_None = mean(None, na.rm = TRUE),
+    mean_D0 = mean(D0, na.rm = TRUE),
+    mean_D1 = mean(D1, na.rm = TRUE),
+    mean_D2 = mean(D2, na.rm = TRUE),
+    mean_D3 = mean(D3, na.rm = TRUE),
+    mean_D4 = mean(D4, na.rm = TRUE),
+  )|>
+  mutate(drought_value = 1*mean_D0+2*mean_D1+3**mean_D2+4**mean_D3+5**mean_D4)|>
+  select(fips,drought_value)
+drought$fips <- sprintf("%05d", as.integer(drought$fips))
+```
+### Data prepare for drought
+```{r}
+population <- read.csv("population.csv")
+population$STATE <- sprintf("%02d", as.integer(population$STATE))
+population$COUNTY <- sprintf("%03d", as.integer(population$COUNTY))
+population <- population |>
+  select(STATE,COUNTY,STNAME,CTYNAME,CENSUS2010POP)|>
+  mutate(fips = paste0(STATE, COUNTY),.keep="unused",.before=1)
+```
+### Data prepare for fire
+```{r}
+#fire <- read_csv("fire.csv")
+fire_processed_last <- fire |>
+  select(FIPS_CODE, FIRE_SIZE_CLASS, DISCOVERY_DOY, DISCOVERY_TIME, CONT_DOY, CONT_TIME, FIRE_YEAR) |>
+  rename(fips = FIPS_CODE, fire_size_class = FIRE_SIZE_CLASS) %>%
+  mutate(
+    fire_last = (CONT_DOY - DISCOVERY_DOY) * 2400 +
+                as.numeric(substr(CONT_TIME, 1, 2)) * 60 + as.numeric(substr(CONT_TIME, 3, 4)) -
+                as.numeric(substr(DISCOVERY_TIME, 1, 2)) * 60 + as.numeric(substr(DISCOVERY_TIME, 3, 4))
+    ,fire_last_new = ifelse(fire_last > 0, fire_last, fire_last + 525600)
+  ) |>
+   filter(fire_last_new>0)|>
+  filter(FIRE_YEAR >= 2012 & FIRE_YEAR <= 2020) |>
+  filter(!is.na(fips)) |>
+  group_by(fips) |>
+  summarise(
+    avg_fire_last = mean(fire_last_new, na.rm = TRUE),
+    times = n()
+  )
+fire_processed_times <- fire |>
+  select(FIPS_CODE, FIRE_SIZE_CLASS, DISCOVERY_DOY, DISCOVERY_TIME, CONT_DOY, CONT_TIME, FIRE_YEAR) |>
+  rename(fips = FIPS_CODE, fire_size_class = FIRE_SIZE_CLASS) %>%
+  mutate(
+    fire_last = (CONT_DOY - DISCOVERY_DOY) * 2400 +
+                as.numeric(substr(CONT_TIME, 1, 2)) * 60 + as.numeric(substr(CONT_TIME, 3, 4)) -
+                as.numeric(substr(DISCOVERY_TIME, 1, 2)) * 60 + as.numeric(substr(DISCOVERY_TIME, 3, 4))
+    ,fire_last_new = ifelse(fire_last >= 0, fire_last, fire_last + 525600)
+  ) |>
+  filter(FIRE_YEAR >= 2012 & FIRE_YEAR <= 2020) |>
+  filter(!is.na(fips)) |>
+  group_by(fips) |>
+  summarise(
+    avg_fire_last = mean(fire_last_new, na.rm = TRUE),
+    times = n()
+  )
+```
+### Combine all dataset
+```{r}
+weather$fips <- sprintf("%05d", as.integer(weather$fips))
+soil$fips <- sprintf("%05d", as.integer(soil$fips))
+#find intersect of 5 dataset
+common_fips_last <- Reduce(intersect, list(drought$fips, fire_processed_last$fips, population$fips, soil$fips, weather$fips))
+drought_filtered <- drought |> filter(fips %in% common_fips)
+fire_filtered <- fire_processed_last |> filter(fips %in% common_fips)
+population_filtered <- population |> filter(fips %in% common_fips)|>
+  mutate(CENSUS2010POP = as.numeric(CENSUS2010POP))
+soil_filtered <- soil |> filter(fips %in% common_fips)
+weather_filtered <- weather |> filter(fips %in% common_fips)
+combined_data_last <- reduce(list(drought_filtered, fire_filtered, population_filtered, soil_filtered, weather_filtered), full_join, by = "fips")
+
+weather$fips <- sprintf("%05d", as.integer(weather$fips))
+soil$fips <- sprintf("%05d", as.integer(soil$fips))
+#find intersect of 5 dataset
+common_fips_times <- Reduce(intersect, list(drought$fips, fire_processed_times$fips, population$fips, soil$fips, weather$fips))
+drought_filtered <- drought |> filter(fips %in% common_fips)
+fire_filtered <- fire_processed_times |> filter(fips %in% common_fips)
+population_filtered <- population |> filter(fips %in% common_fips)|>
+  mutate(CENSUS2010POP = as.numeric(CENSUS2010POP))
+soil_filtered <- soil |> filter(fips %in% common_fips)
+weather_filtered <- weather |> filter(fips %in% common_fips)
+combined_data_times <- reduce(list(drought_filtered, fire_filtered, population_filtered, soil_filtered, weather_filtered), full_join, by = "fips")
+```
+##EDA
+```{r}
+# Check missing data
+missing_counts <- colSums(is.na(combined_data_times))
+missing_counts <- missing_counts[missing_counts != 0]
+print(missing_counts)
+
+library(tigris)
+options(tigris_use_cache = TRUE)
+counties <- tigris::counties(cb = TRUE, class = "sf")
+map_data <- merge(counties, combined_data_last, by.x = "GEOID", by.y = "fips")
+
+ggplot(map_data) +
+  aes(fill = avg_fire_last) +
+  geom_sf(size = 1.2) +
+  scale_fill_gradient(low = "#EFEFEF", high = "#0A8BEE") +
+  labs(title = "avergae fire last in US")+
+  theme_minimal()
+
+map_data_times <- merge(counties, combined_data_times, by.x = "GEOID", by.y = "fips")
+ggplot(map_data_times) +
+  aes(fill = times) +
+  geom_sf(size = 1.2) +
+  scale_fill_gradient(low = "#F8F4F5", high = "#E91245") +
+  labs(title = "times of fire ") +
+  theme_minimal()
+#correlation matrix
+cor_last <- combined_data_last[,c(3,4,2,7,8,9,10,11,12,13,14,16,17,18,19)]
+cor_last_matrix <- as.data.frame(as.table(abs(cor(cor_last))))
+colnames(cor_last_matrix) <- c("Variable1", "Variable2", "Correlation")
+ggplot(cor_last_matrix, aes(Variable1, Variable2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "black") +
+  theme_minimal() +
+  labs(title = "Correlation Heatmap", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+## model for fire last
+### Null Model
+```{r}
+fit_null_last <- lm(avg_fire_last~1,data = combined_data_last)
+summary(fit_null_last)
+```
+### choose variable
+```{r}
+percentile_1 <- quantile(combined_data_last$avg_fire_last, 0.01)
+percentile_99 <- quantile(combined_data_last$avg_fire_last, 0.99)
+
+# Truncate the data
+truncated_data_last <- subset(combined_data_last, avg_fire_last >= percentile_1 & avg_fire_last <= percentile_99)
+#remove population and cultivate land, overdispersion, using Gamma 
+fit_1 <- glm(avg_fire_last~drought_value + elevation + WAT_LAND + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS10M + mean_WS50M + mean_PRECTOT,data=truncated_data_last,family=Gamma(link="log"))
+summary(fit_1)
+library(car)
+vif(fit_1)
+#remove mean_WS50M, failed
+fit_2 <- glm(avg_fire_last~drought_value + elevation + WAT_LAND + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS10M + mean_PRECTOT,data=truncated_data_last,family=Gamma(link="log"))
+summary(fit_2)
+#Model stability and data distribution: Removing certain variables may change the overall stability of the model. For example, if mean_WS50M is correlated with other variables, its presence may help balance the model. After removing this variable, the model may become unstable, especially if the variability of avg_fire_last is not well explained by other variables.
+
+#Effect of collinearity: High collinearity may lead to unstable model parameter estimates. In some cases, including variables with high collinearity may unexpectedly increase the stability of the model, although such a model may not have good predictive power.
+
+#remove WAT_LAND, mean_WS10M, mean_PRECTOR, according to the actual
+fit_3 <- glm(avg_fire_last~elevation + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS50M,data=truncated_data_last,family=Gamma(link="log"))
+summary(fit_3)
+
+#residual test
+residuals <- residuals(fit_3)
+plot(truncated_data_last$avg_fire_last, residuals)
+abline(h=0)
+
+qqnorm(residuals)
+qqline(residuals)
+
+#exist heteroskedasticity, using log 
+fit_4 <- glm(log_avg_fire_last ~ elevation + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS50M,
+                      data = truncated_data_last,
+                      family = Gamma(link = "log"))
+
+
+residuals <- residuals(fit_3_weighted)
+plot(truncated_data_last$log_avg_fire_last, residuals)
+abline(h=0)
+
+qqnorm(residuals)
+qqline(residuals)
+#The results are still not ideal, and variables that may already exist cannot accurately predict fire duration. Maybe the duration of the fire is more related to the local fire protection situation, etc.
+```
+###partial pooling
+```{r}
+library(lme4)
+fit_5 <- glmer(log_avg_fire_last ~ elevation + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS50M +(1|STNAME),
+                      data = truncated_data_last,
+                      family = Gamma(link = "log"))
+# Warning: Model failed to converge with max|grad| = 0.755596 (tol = 0.002, component 1)Warning: Model is nearly unidentifiable: very large eigenvalue
+#  - Rescale variables?;Model is nearly unidentifiable: large eigenvalue ratio
+#  - Rescale variables?
+# cannot forecast the last of fire.
+```
+## model for fire times
+### Null Model
+```{r}
+boxplot(combined_data_times$times)
+percentile_1 <- quantile(combined_data_times$times, 0.05)
+percentile_99 <- quantile(combined_data_times$times, 0.95)
+# Truncate the data
+truncated_data_times <- subset(combined_data_times, times >= percentile_1 & times <= percentile_99)
+time_data <- truncated_data_times
+fit_6 <- lm(times ~ 1, data = time_data)
+summary(fit_6)
+```
+
+###complete pooling
+```{r}
+cor_last <- time_data[,c(4,2,7,8,9,10,11,12,13,14,16,17,18,19)]
+cor_last_matrix <- as.data.frame(as.table(abs(cor(cor_last))))
+colnames(cor_last_matrix) <- c("Variable1", "Variable2", "Correlation")
+ggplot(cor_last_matrix, aes(Variable1, Variable2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "black") +
+  theme_minimal() +
+  labs(title = "Correlation Heatmap", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(time_data, aes(x = slope, y = times)) +
+  geom_boxplot()
+hist(time_data$times)
+library(MASS)
+library(rstan)
+library(rstanarm)
+library(brms)
+library(bayesplot)
+fit_7<- stan_glm(times~drought_value+CENSUS2010POP+CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT,data=time_data,family=poisson(link="log"))
+summary(fit_7,digits=2)
+post_resid <- posterior_predict(fit_7)
+ppc_dens_overlay(time_data$times,post_resid[1:100,])
+
+residuals <- residuals(fit_7)
+
+plot(time_data$times, residuals)
+abline(h=0)
+
+qqnorm(residuals)
+qqline(residuals)
+
+weights <- 1/residuals(fit_7)^2
+fit_8<- stan_glm(times~drought_value+CENSUS2010POP+CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT,data=time_data,family=poisson(link="log"),weights = weights)
+summary(fit_8,digits=2)
+post_resid <- posterior_predict(fit_8)
+ppc_dens_overlay(time_data$times,post_resid[1:100,])
+
+residuals <- residuals(fit_8)
+
+plot(time_data$times, residuals)
+abline(h=0)
+
+qqnorm(residuals)
+qqline(residuals)
+```
+### partial pooling
+```{r}
+fit_9<- stan_glmer(times~drought_value+CENSUS2010POP*CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT + (1|STNAME),data=time_data, family=poisson(link="log"))
+summary(fit_9,digits=2)
+residuals <- residuals(fit_8)
+plot(time_data$times, residuals)
+abline(h=0)
+post_resid <- posterior_predict(fit_9)
+ppc_dens_overlay(time_data$times,post_resid[1:100,])
+fit_10<- stan_glmer(times~drought_value+CENSUS2010POP*CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT + (1|STNAME),data=time_data, family=Gamma(link="inverse"))
+```
+### no pooling
+
+

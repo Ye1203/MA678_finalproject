@@ -124,7 +124,7 @@ population <- population |>
 ```
 ### Data prepare for fire
 ```{r}
-#fire <- read_csv("fire.csv")
+fire <- read_csv("fire.csv")
 fire_processed_last <- fire |>
   select(FIPS_CODE, FIRE_SIZE_CLASS, DISCOVERY_DOY, DISCOVERY_TIME, CONT_DOY, CONT_TIME, FIRE_YEAR) |>
   rename(fips = FIPS_CODE, fire_size_class = FIRE_SIZE_CLASS) %>%
@@ -164,7 +164,7 @@ fire_processed_times <- fire |>
 weather$fips <- sprintf("%05d", as.integer(weather$fips))
 soil$fips <- sprintf("%05d", as.integer(soil$fips))
 #find intersect of 5 dataset
-common_fips_last <- Reduce(intersect, list(drought$fips, fire_processed_last$fips, population$fips, soil$fips, weather$fips))
+common_fips <- Reduce(intersect, list(drought$fips, fire_processed_last$fips, population$fips, soil$fips, weather$fips))
 drought_filtered <- drought |> filter(fips %in% common_fips)
 fire_filtered <- fire_processed_last |> filter(fips %in% common_fips)
 population_filtered <- population |> filter(fips %in% common_fips)|>
@@ -235,7 +235,7 @@ percentile_99 <- quantile(combined_data_last$avg_fire_last, 0.99)
 
 # Truncate the data
 truncated_data_last <- subset(combined_data_last, avg_fire_last >= percentile_1 & avg_fire_last <= percentile_99)
-#remove population and cultivate land, overdispersion, using Gamma 
+#remove , overdispersion, using Gamma 
 fit_1 <- glm(avg_fire_last~drought_value + elevation + WAT_LAND + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS10M + mean_WS50M + mean_PRECTOT,data=truncated_data_last,family=Gamma(link="log"))
 summary(fit_1)
 library(car)
@@ -260,12 +260,13 @@ qqnorm(residuals)
 qqline(residuals)
 
 #exist heteroskedasticity, using log 
+truncated_data_last$log_avg_fire_last=log(truncated_data_last$avg_fire_last)
 fit_4 <- glm(log_avg_fire_last ~ elevation + NVG_LAND + URB_LAND + GRS_LAND + FOR_LAND + slope + mean_QV2M + mean_WS50M,
                       data = truncated_data_last,
                       family = Gamma(link = "log"))
+summary(fit_4)
 
-
-residuals <- residuals(fit_3_weighted)
+residuals <- residuals(fit_4)
 plot(truncated_data_last$log_avg_fire_last, residuals)
 abline(h=0)
 
@@ -320,18 +321,18 @@ fit_7<- stan_glm(times~drought_value+CENSUS2010POP+CULT_LAND+FOR_LAND+mean_QV2M+
 summary(fit_7,digits=2)
 post_resid <- posterior_predict(fit_7)
 ppc_dens_overlay(time_data$times,post_resid[1:100,])
-
-residuals <- residuals(fit_7)
-
-plot(time_data$times, residuals)
-abline(h=0)
-
-qqnorm(residuals)
-qqline(residuals)
-
-weights <- 1/residuals(fit_7)^2
-fit_8<- stan_glm(times~drought_value+CENSUS2010POP+CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT,data=time_data,family=poisson(link="log"),weights = weights)
-summary(fit_8,digits=2)
+# 
+# residuals <- residuals(fit_7)
+# 
+# plot(time_data$times, residuals)
+# abline(h=0)
+# 
+# qqnorm(residuals)
+# qqline(residuals)
+# 
+# weights <- 1/residuals(fit_7)^2
+# fit_8<- stan_glm(times~drought_value+CENSUS2010POP+CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT,data=time_data,family=poisson(link="log"),weights = weights)
+# summary(fit_8,digits=2)
 post_resid <- posterior_predict(fit_8)
 ppc_dens_overlay(time_data$times,post_resid[1:100,])
 
@@ -346,14 +347,18 @@ qqline(residuals)
 ### partial pooling
 ```{r}
 fit_9<- stan_glmer(times~drought_value+CENSUS2010POP*CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT + (1|STNAME),data=time_data, family=poisson(link="log"))
-summary(fit_9,digits=2)
+summary(fit_9,digits=3)
 residuals <- residuals(fit_8)
 plot(time_data$times, residuals)
 abline(h=0)
 post_resid <- posterior_predict(fit_9)
 ppc_dens_overlay(time_data$times,post_resid[1:100,])
-fit_10<- stan_glmer(times~drought_value+CENSUS2010POP*CULT_LAND+FOR_LAND+mean_QV2M+mean_WS10M+mean_WS50M+mean_PRECTOT + (1|STNAME),data=time_data, family=Gamma(link="inverse"))
 ```
 ### no pooling
+```{r}
+fit_no_pooling <- stan_glmer(times ~ drought_value + CENSUS2010POP * CULT_LAND + FOR_LAND + mean_QV2M + mean_WS10M + mean_WS50M + mean_PRECTOT + (1 + drought_value + CENSUS2010POP * CULT_LAND + FOR_LAND + mean_QV2M + mean_WS10M + mean_WS50M + mean_PRECTOT | STNAME), data = time_data, family = Gamma(link = "inverse"))
+summary(fit_no_pooling)
+stan_rhat(fit_no_pooling)
+```
 
 
